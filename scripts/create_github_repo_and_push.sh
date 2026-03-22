@@ -71,12 +71,16 @@ cd "${ROOT}"
 GIT_TERMINAL_PROMPT=0 git remote remove origin 2>/dev/null || true
 GIT_TERMINAL_PROMPT=0 git remote add origin "https://github.com/${OWNER}/${REPO}.git"
 
-# Push using token in URL (in-memory only for this process).
-# oauth2:<token> is the recommended form for HTTPS Git operations with PATs.
-if ! GIT_TERMINAL_PROMPT=0 git push --set-upstream "https://oauth2:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git" main; then
+# Push using token in URL. Do NOT use --set-upstream with this URL — Git would store the
+# token inside .git/config. Push anonymously to the auth URL, then track origin/main.
+if ! GIT_TERMINAL_PROMPT=0 git push "https://oauth2:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git" main; then
   echo "Error: git push failed. Check token has \"repo\" (or contents: write) and repo name matches."
   exit 1
 fi
+
+GIT_TERMINAL_PROMPT=0 git fetch origin
+GIT_TERMINAL_PROMPT=0 git branch --unset-upstream 2>/dev/null || true
+GIT_TERMINAL_PROMPT=0 git branch -u "origin/main" main
 
 echo "==> Done. Open: https://github.com/${OWNER}/${REPO}"
 echo "==> Remote 'origin' is set to https (without token). Configure credential helper for future pushes."
