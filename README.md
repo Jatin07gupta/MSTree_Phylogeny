@@ -1,546 +1,507 @@
-# CLNJ Pipeline (C++)
+# CLNJ / MSTree phylogeny pipeline (C++)
 
-A high-performance C++17 implementation of the **Multi-Model Distance-based Phylogenetic Tree Reconstruction Pipeline** using Latent Tree Graphical Models (LTGM). This pipeline reconstructs phylogenetic trees with both observed (leaf) and hidden (ancestral) nodes from DNA/RNA sequence data.
+This repository implements a **complete distance-based phylogenetic reconstruction system** in **C++17**: from **FASTA input** through **multi-model pairwise distances**, **Algorithm 2** (laminar family + union graph), **MLVMST**, and **CLNJ** (local NJ / MFNJ / BioNJ with hidden nodes), to **persistent tree state** and **dynamic (online) insertion** of new taxa without rebuilding the full pipeline from scratch.
 
-The implementation is a faithful port of the original Python pipeline, producing numerically identical results on all core algorithms while leveraging C++ for performance.
-
----
-
-## Table of Contents
-
-1. [Pipeline Overview](#pipeline-overview)
-2. [Pipeline Stages](#pipeline-stages)
-3. [Distance Models](#distance-models)
-4. [Tree Reconstruction Algorithms](#tree-reconstruction-algorithms)
-5. [Key Features](#key-features)
-6. [Project Structure](#project-structure)
-7. [Requirements](#requirements)
-8. [Building](#building)
-9. [Usage](#usage)
-10. [CLI Reference](#cli-reference)
-11. [Examples](#examples)
-12. [Diagnostics](#diagnostics)
-13. [Pipeline Constants](#pipeline-constants)
+The design is aligned with the **`clnj_fresh`** Python stack (`run_snj_pipeline.py`, `distance.py`, `algorithm2_FC_GU_fixed.py`, `mlvmst.py`, `clnj_clean_implementation_no_negative.py`, `distance_oracle.py`): same **stage ordering**, **distance models**, and **numerical constants** (`types.h`), with C++ providing a **single binary** and better scalability.
 
 ---
 
-## Pipeline Overview
+## Table of contents
 
-The pipeline takes a FASTA file (aligned or unaligned DNA/RNA sequences) as input and produces a phylogenetic tree with observed and hidden (ancestral) nodes. The workflow proceeds through 8 stages:
+1. [What “the pipeline” includes](#what-the-pipeline-includes)
+2. [End-to-end lifecycle](#end-to-end-lifecycle)
+3. [Phase 1 — Batch reconstruction (Stages 0–8)](#phase-1--batch-reconstruction-stages-08)
+4. [Phase 1 — Stateful preparation (Stage 9)](#phase-1--stateful-preparation-stage-9)
+5. [Phase 2 — Dynamic (online) insertion](#phase-2--dynamic-online-insertion)
+6. [CLI: `build`, `insert`, and `dump`](#cli-build-insert-and-dump)
+7. [Persistent state: `TreeState` binary format](#persistent-state-treestate-binary-format)
+8. [Module catalog (every source file)](#module-catalog-every-source-file)
+9. [Implementation note: sequences, one-hot, and planned direct encoding](#implementation-note-sequences-one-hot-and-planned-direct-encoding)
+10. [Experimental: alignment-free k-mer distance](#experimental-alignment-free-k-mer-distance)
+11. [Distance models](#distance-models)
+12. [Tree reconstruction algorithms](#tree-reconstruction-algorithms)
+13. [Key features](#key-features)
+14. [Requirements and building](#requirements-and-building)
+15. [Examples](#examples)
+16. [Diagnostics](#diagnostics)
+17. [Pipeline constants](#pipeline-constants)
+18. [GitHub (`MSTree_Phylogeny`)](#github-mstree_phylogeny)
+19. [References](#references)
+
+---
+
+## What “the pipeline” includes
+
+| Component | Role |
+|-----------|------|
+| **Batch reconstruction** | Stages **0–8**: alignment → clean FASTA → diagnostics & model → **D** → Algorithm 2 → MLVMST → CLNJ → analysis → summary. |
+| **Stateful preparation (Stage 9)** | After a satisfactory tree, **MDL clustering** builds a **hierarchy of observed-taxa clusters** on the tree; **`TreeState`** serializes sequences, **D**, topology, model parameters, cluster tree, and **cached encodings** for fast updates. |
+| **Dynamic insertion** | **`insert`** loads `TreeState`, assigns each new sequence to a cluster, **extends** **D**, **locally** re-runs NJ/MFNJ/BioNJ on the affected subgraph, **splices** back, updates cluster membership, and **saves** state again. |
+
+Together, these define the **full pipeline** as a **living** system: initial tree + **incremental evolution**.  
+
+If you only need a **one-off** tree and will **never** add sequences, you may run **`build` without `--save-state`**; you then use **only** Phase 1 Stages 0–8. That is a **subset** of the system, not a separate product.
+
+---
+
+## End-to-end lifecycle
 
 ```
-FASTA Input
-    |
-    v
-[Stage 0] Alignment Detection (+ auto-MAFFT if needed)
-    |
-    v
-[Stage 1] Load, Clean, Filter Sequences
-    |
-    v
-[Stage 2] One-Hot Encoding + Alignment Diagnostics
-    |                              |
-    |                  [Stage 2c] IQ-TREE Model Selection (optional)
-    |
-    v
-[Stage 3] Pairwise Distance Matrix (alignment-based or k-mer)
-    |
-    v
-[Stage 4] Algorithm 2 -- Laminar Family (F_C) and Union Graph (G_U)
-    |
-    v
-[Stage 5] MLVMST -- Initial Tree Topology
-    |
-    v
-[Stage 6] CLNJ -- Cluster-based Neighbor-Joining (local tree refinement)
-    |
-    v
-[Stage 7] Tree Analysis and Statistics
-    |
-    v
-[Stage 8] Pipeline Summary
-```
-
----
-
-## Pipeline Stages
-
-### Stage 0: Alignment Detection
-
-Checks whether the input FASTA file contains already-aligned sequences (uniform length). If not, automatically invokes **MAFFT** with a size-dependent strategy:
-
-| Dataset Size | MAFFT Strategy |
-|---|---|
-| n < 500 | `--auto` (MAFFT chooses best) |
-| 500 <= n < 10,000 | `--retree 2` (FFT-NS-2) |
-| n >= 10,000 | `--retree 1` (FFT-NS-1, fastest) |
-
-For RNA data with `--rna-struct`, uses `--kimura 1 --xinsi` for structure-aware alignment.
-
-Skipped entirely when using `--distance-method kmer`.
-
-### Stage 1: Load, Clean, Filter
-
-Parses the FASTA file and applies quality filters:
-
-- **DIVIDER removal**: Skips separator records (names containing "DIVIDER").
-- **Short sequence removal**: Sequences with fewer than `min_non_gap` valid (non-gap) nucleotides are removed.
-- **Ambiguity filter**: Sequences exceeding `max_ambiguity` fraction of ambiguous bases (N, R, Y, etc.) are removed.
-- **Length-percentile cutoff**: Sequences below the `length_percentile_cutoff`-th percentile of valid-site counts are removed.
-- **Optional subsampling**: Random subset of N sequences (deterministic with seed=42).
-- **U to T normalization**: RNA uracil bases are converted to thymine.
-
-### Stage 2: One-Hot Encoding and Diagnostics
-
-Encodes each nucleotide position into a 4-element vector: A=[1,0,0,0], C=[0,1,0,0], G=[0,0,1,0], T=[0,0,0,1]. Gaps and ambiguous characters are encoded as [0,0,0,0].
-
-**Alignment Diagnostics** (Stage 2b) compute:
-- Base composition frequencies (gA, gC, gG, gT)
-- Transition/transversion ratio (Ts/Tv)
-- Mean p-distance across sampled pairs
-- Frequency uniformity test
-
-These diagnostics drive the AUTO model selection heuristic.
-
-### Stage 2c: IQ-TREE Model Selection (optional)
-
-When `--model IQTREE` is specified, invokes `iqtree2` externally for likelihood-based model selection using BIC. The selected IQ-TREE model is mapped to the pipeline's supported models:
-
-| IQ-TREE Model | Pipeline Model |
-|---|---|
-| JC, JC+... | JC69 |
-| K2P, K80, K2P+... | K2P |
-| HKY, TN, TN93, TNe, TIM, ... | TN93 |
-| GTR, SYM, TPM, TVM, ... | TN93 |
-
-Gamma rate heterogeneity parameters are extracted when present.
-
-### Stage 3: Distance Matrix
-
-Computes an n x n pairwise distance matrix using the selected model. Two distance computation paths:
-
-**Alignment-based** (default): Uses one-hot encoded data with pairwise deletion for gap handling. A `min_shared_sites` threshold ensures reliable estimates.
-
-**K-mer based** (`--distance-method kmer`): Alignment-free Mash distance using MinHash sketching. Does not require aligned sequences.
-
-### Stage 4: Algorithm 2 (F_C and G_U)
-
-Constructs the laminar family F_C and union graph G_U from the distance matrix using a Kruskal-like sweep with a Disjoint Set Union (DSU) data structure. Edges are sorted by distance and processed to build hierarchical cluster structure.
-
-### Stage 5: MLVMST (Algorithm 3)
-
-Builds the Minimum Leaves Vertex-Order Minimum Spanning Tree. Computes `delta_max` scores for each taxon and constructs the initial tree topology using a vertex-ordered Kruskal MST algorithm.
-
-### Stage 6: CLNJ (Cluster-based Neighbor-Joining)
-
-The core reconstruction step. Iterates over internal nodes of the MLVMST (sorted by degree, descending) and performs local tree refinement:
-
-1. For each internal node, extract its neighborhood (center + adjacent nodes).
-2. Run a local NJ variant (NJ, MFNJ, or BioNJ) on the neighborhood.
-3. Splice the locally reconstructed subtree back into the global tree.
-4. Validate tree invariant (|E| = |V| - 1) after each splice.
-
-A **context-aware distance oracle** provides distances: observed-observed pairs use the original distance matrix; pairs involving hidden nodes use BFS tree-path distances for additivity guarantees.
-
-Branch-length redistribution enforces non-negative edge weights: when delta_i < floor, set delta_i = floor and delta_j = d_ij - floor.
-
-### Stage 7: Tree Analysis
-
-Computes comprehensive statistics on the final tree:
-- Node counts (observed, hidden, total)
-- Edge weight statistics (min, max, mean, median, std)
-- Edge type breakdown (obs-obs, obs-hidden, hidden-hidden)
-- Degree distribution (leaves, max degree)
-- Tree validity check
-
-Runs on both the floored (min_branch_length = 1e-6) and raw (min_branch_length = 0) trees for comparison.
-
-### Stage 8: Pipeline Summary
-
-Prints a complete summary including dataset info, timings, distance matrix statistics, and tree characteristics.
-
----
-
-## Distance Models
-
-| Model | Description | When to Use |
-|---|---|---|
-| **JC69** | Jukes-Cantor (1969). Equal base frequencies, equal substitution rates. Simplest model. | Low divergence, uniform composition |
-| **K2P** | Kimura 2-parameter (1980). Distinguishes transitions from transversions. | Moderate divergence, Ts/Tv bias |
-| **TN93** | Tamura-Nei (1993). Unequal base frequencies, two transition rates, one transversion rate. | Unequal composition, high Ts/Tv ratio |
-| **LOGDET** | Log-determinant (paralinear). Model-free, handles composition heterogeneity across lineages. | Compositional bias between taxa |
-| **AUTO** | Heuristic selection using 5 alignment diagnostics: invariant sites, site-rate CV, gamma alpha, per-taxon composition, Ts/Tv ratio. | General purpose |
-| **IQTREE** | External likelihood-based model selection via IQ-TREE2 (BIC criterion). | Best-fit model when IQ-TREE is available |
-
-All alignment-based models support **gamma rate heterogeneity correction** via the `--gamma-alpha` parameter. The gamma transform is: `d = alpha * (x^(-1/alpha) - 1)`.
-
----
-
-## Tree Reconstruction Algorithms
-
-| Algorithm | Flag | Description |
-|---|---|---|
-| **Standard NJ** | `nj` | Classic Neighbor-Joining (Saitou & Nei 1987). Binary tree, Q-matrix based pair selection. |
-| **MFNJ** | `mfnj` | MultiFurcating Neighbor-Joining (Fernandez et al. 2023). Detects Q-matrix ties and creates polytomies instead of arbitrary zero-length binary splits. Produces a unique tree independent of input order. **Default algorithm.** |
-| **BioNJ** | `bionj` | Variance-minimizing NJ (Gascuel 1997). Uses optimal weighting parameter lambda* to minimize variance of distance estimates during agglomeration. |
-
----
-
-## Key Features
-
-- **Modular architecture**: Each pipeline stage is a separate, self-contained module.
-- **Multi-model distance support**: 5 alignment-based models + alignment-free k-mer distance.
-- **Automatic alignment**: MAFFT integration with size-dependent strategies.
-- **IQ-TREE integration**: External likelihood-based model selection.
-- **Three NJ variants**: Standard NJ, MFNJ (polytomy-aware), BioNJ (variance-minimizing).
-- **Context-aware distance oracle**: Guarantees additive distances for hidden-node neighborhoods.
-- **Branch-length redistribution**: Non-negative edge weights via redistribution (not clamping).
-- **Diagnostic counters**: Track negative values and zero-length edges across all NJ variants.
-- **Gamma rate heterogeneity**: Optional correction for among-site rate variation.
-- **Pairwise deletion**: Gap handling with configurable minimum shared sites.
-- **Deterministic subsampling**: Reproducible results with fixed seed (42).
-- **Comprehensive tree analysis**: Edge statistics, degree distribution, validity checks.
-- **Dual-run comparison**: Automatically compares floored vs. raw branch lengths.
-- **Zero external dependencies at build time**: Eigen and CLI11 are fetched automatically by CMake.
-
----
-
-## Project Structure
-
-```
-clnj_cpp/
-├── CMakeLists.txt                  # Build configuration (CMake 3.14+)
-├── README.md                       # This file
-│
-├── include/                        # Header files
-│   ├── types.h                     # Constants, type aliases, structs, enums
-│   ├── fasta_parser.h              # FASTA parsing and sequence cleaning
-│   ├── one_hot.h                   # One-hot encoding of nucleotide sequences
-│   ├── distance.h                  # Distance model computation and AUTO selection
-│   ├── kmer_distance.h             # Alignment-free k-mer (Mash) distance
-│   ├── alignment_utils.h           # Alignment detection and MAFFT wrapper
-│   ├── iqtree_interface.h          # IQ-TREE2 model selection interface
-│   ├── algorithm2.h                # Algorithm 2: F_C and G_U construction
-│   ├── mlvmst.h                    # MLVMST (Algorithm 3): initial tree topology
-│   ├── distance_oracle.h           # Context-aware distance queries (D_obs + BFS)
-│   ├── nj.h                        # Standard Neighbor-Joining
-│   ├── mfnj.h                      # MultiFurcating Neighbor-Joining
-│   ├── bionj.h                     # BioNJ (variance-minimizing NJ)
-│   ├── clnj.h                      # CLNJ dispatcher (iterative local refinement)
-│   ├── tree_analysis.h             # Final tree statistics and reporting
-│   └── pipeline.h                  # Pipeline orchestration and PipelineArgs
-│
-├── src/                            # Source files
-│   ├── main.cpp                    # CLI entry point (CLI11 argument parsing)
-│   ├── pipeline.cpp                # End-to-end pipeline orchestration (Stages 0-8)
-│   ├── fasta_parser.cpp            # FASTA I/O, filtering, cleaning
-│   ├── one_hot.cpp                 # Nucleotide -> one-hot lookup table encoding
-│   ├── distance.cpp                # JC69, K2P, TN93, LogDet, AUTO, gamma correction
-│   ├── kmer_distance.cpp           # Canonical k-mers, FNV-1a hash, MinHash, Mash
-│   ├── alignment_utils.cpp         # is_aligned(), align_with_mafft()
-│   ├── iqtree_interface.cpp        # iqtree2 invocation and .iqtree output parsing
-│   ├── algorithm2.cpp              # DSU-based F_C/G_U construction
-│   ├── mlvmst.cpp                  # delta_max computation, vertex-ordered MST
-│   ├── distance_oracle.cpp         # BFS tree-path distance, DistanceOracle class
-│   ├── nj.cpp                      # Standard NJ with diagnostics
-│   ├── mfnj.cpp                    # MFNJ with tie detection and polytomies
-│   ├── bionj.cpp                   # BioNJ with variance matrix and lambda*
-│   ├── clnj.cpp                    # CLNJ iteration, splicing, tree invariant checks
-│   └── tree_analysis.cpp           # Edge/node statistics, degree analysis
-│
-└── build/                          # Build output directory (created by CMake)
+  FASTA (DNA/RNA)
+        |
+        v
+  +-------------------+
+  | Stage 0: Align?   |  MAFFT if unaligned (skipped in k-mer mode only)
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 1: Clean    |  Filters, subsampling, U->T
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 2: Diag.    |  Base freqs, Ts/Tv, p-dist; optional IQ-TREE
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 3: D (nxn)  |  Substitution models + pairwise deletion
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 4: Alg. 2   |  F_C laminar family, G_U union graph
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 5: MLVMST   |  Initial scaffold (Kruskal/Boruvka backend)
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 6: CLNJ     |  Local NJ/MFNJ/BioNJ + distance oracle
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 7: Analysis |  Stats; floored vs raw branch comparison
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Stage 8: Summary  |
+  +-------------------+
+        |
+        |    build --save-state <path>
+        v
+  +-------------------+
+  | Stage 9: MDL      |  Cluster tree on observed taxa + save TreeState
+  +-------------------+
+        |
+        v
+   .state file(s)
+        |
+        |    insert <state> <new.fasta>  (repeat as needed)
+        v
+  +-------------------+
+  | Phase 2: Insert   |  Assign cluster -> extend D -> local rebuild -> save
+  +-------------------+
 ```
 
 ---
 
-## Requirements
+## Phase 1 — Batch reconstruction (Stages 0–8)
 
-### Build Requirements
+### Stage 0 — Alignment detection and MAFFT
 
-| Requirement | Version | Notes |
-|---|---|---|
-| **C++ compiler** | C++17 support | GCC 7+, Clang 5+, or MSVC 2017+ |
-| **CMake** | 3.14+ | Build system |
-| **Internet access** | (first build only) | To download Eigen and CLI11 via FetchContent |
+**Files:** `alignment_utils.{h,cpp}`, `fasta_parser.cpp` (for counting sequences before MAFFT).
 
-The following libraries are **automatically downloaded** during the first CMake build:
+- Tests whether all sequences in the FASTA have the **same length** (`is_aligned`).
+- If **unaligned** and **`--no-align` is not set**, runs **MAFFT** with **size-dependent** options (small \(n\): `--auto`; medium: `--retree 2`; large: `--retree 1`).
+- **`--rna-struct`**: structure-aware MAFFT (X-INS-i style).
+- In **`--distance-method kmer`** only, alignment is **skipped** (experimental path; see [Experimental k-mer](#experimental-alignment-free-k-mer-distance)).
 
-| Library | Version | Purpose |
-|---|---|---|
-| **Eigen** | 3.4.0 | Dense matrix operations (distance matrices, one-hot encoding) |
-| **CLI11** | 2.4.1 | Command-line argument parsing |
+### Stage 1 — Load, clean, filter
 
-### Runtime Requirements (Optional External Tools)
+**Files:** `fasta_parser.{h,cpp}`.
 
-These are only needed if you use the corresponding features:
+- **`parse_fasta`**: reads `FastaRecord` {name, sequence}.
+- **`load_clean_fasta`**: removes DIVIDER-like records, enforces **`min_non_gap`**, **`max_ambiguity`**, **`length_percentile_cutoff`**; optional uniform length check (relaxed for k-mer).
+- **Subsampling** (if `subsample_n > 0`): deterministic shuffle with **`SEED = 42`** in `pipeline.cpp`.
+- **U → T** normalization for RNA.
 
-| Tool | Required For | Installation |
-|---|---|---|
-| **MAFFT** | Automatic alignment of unaligned FASTA input | `sudo apt install mafft` or from [mafft.cbrc.jp](https://mafft.cbrc.jp/alignment/software/) |
-| **IQ-TREE2** | `--model IQTREE` model selection | Download from [iqtree.org](http://www.iqtree.org/) or GitHub releases |
+**Output:** `CleanResult`: parallel vectors **`names`**, **`sequences`**, alignment length **`m`** (for alignment mode).
 
-Both tools must be accessible on `PATH` (or symlinked into your environment's `bin/` directory).
+### Stage 2 — Alignment diagnostics and model resolution
 
-### System Requirements
+**Files:** `one_hot.{h,cpp}`, `distance.{h,cpp}`, `iqtree_interface.{h,cpp}`.
 
-- **OS**: Linux (tested), macOS (should work), Windows (untested)
-- **RAM**: Depends on dataset size. The n x n distance matrix requires O(n^2) memory.
-- **Disk**: Minimal. Temporary files are created for MAFFT/IQ-TREE and cleaned up automatically.
+- **One-hot encoding** of cleaned sequences (`one_hot_encode`) → tensor **(n, m, 4)** for fast column statistics.
+- **`compute_pair_counts`**: empirical **gA, gC, gG, gT**, **Ts/Tv**, mean **p-distance**, composition flags — used by **AUTO** (`select_model`).
+- **`--model IQTREE`**: runs **`run_iqtree_model_selection`** (subprocess to **IQ-TREE2**), parses `.iqtree` output, maps to **JC69 / K2P / TN93**, may set **gamma** from IQ-TREE.
+
+### Stage 3 — Pairwise distance matrix **D**
+
+**Files:** `distance.{h,cpp}`, `one_hot.h` (input type for alignment path).
+
+- **`compute_distance_matrix`**: full **n × n** matrix under **JC69, K2P, TN93, LogDet, AUTO** with **pairwise deletion** and **`min_shared_sites`**.
+- Optional **gamma** correction via **`jc69_correct` / `k2p_correct` / `tn93_correct`** and **`--gamma-alpha`**.
+- Distances capped by **`MAX_DIST`**.
+
+**Conceptual input:** aligned **character** sequences; **current** implementation uses **OneHotData** as the concrete representation (see [Implementation note](#implementation-note-sequences-one-hot-and-planned-direct-encoding)).
+
+### Stage 4 — Algorithm 2 (**F_C**, **G_U**)
+
+**Files:** `algorithm2.{h,cpp}`.
+
+- **`construct_FC_and_GU(D)`**: Kruskal-like sweep over sorted pairwise edges with **DSU** to build:
+  - **F_C**: laminar family of clusters.
+  - **G_U**: edge set of the union graph.
+
+### Stage 5 — MLVMST (Algorithm 3)
+
+**Files:** `mlvmst.{h,cpp}`.
+
+- **`build_mlvmst`**: computes **delta_max**, builds **vertex-ordered MST** adjacency on the Algorithm 2 structure.
+- **`--mst-algorithm`**: `kruskal` or `boruvka`.
+
+### Stage 6 — CLNJ
+
+**Files:** `clnj.{h,cpp}`, `distance_oracle.{h,cpp}`, `nj.{h,cpp}`, `mfnj.{h,cpp}`, `bionj.{h,cpp}`.
+
+- **`clnj_clean`**: iterates over internal nodes of the MLVMST (by degree), extracts neighborhoods, builds **`DistanceOracle`** (matrix distances for leaves; **BFS path sums** when hidden nodes involved), runs **`nj_local` / `mfnj_local` / `bionj_local`**, splices subtrees, **redistributes** negative branch proposals to keep **non-negative** edges.
+- Flags **`--report-negatives`**, **`--trace-zero-edges`** fill **`ClnjResult`** diagnostics.
+
+### Stage 7 — Tree analysis
+
+**Files:** `tree_analysis.{h,cpp}`.
+
+- **`analyze_tree`**: node/edge counts, weight summaries, obs/hidden/hidden-hidden edge classes, degree distribution, validity (**|E| = |V| − 1** for tree).
+- Invoked for **floored** (`MIN_BRANCH`) and **raw** (`0`) CLNJ outputs.
+
+### Stage 8 — Pipeline summary
+
+**File:** `pipeline.cpp`.
+
+- Prints timings, **D** statistics, tree summaries (console log suitable for experiments / supplementary logs).
 
 ---
 
-## Building
+## Phase 1 — Stateful preparation (Stage 9)
+
+**Files:** `mdl_clustering.{h,cpp}`, `tree_state.{h,cpp}`, `pipeline.cpp` (orchestration).
+
+When **`build` is run with `--save-state <path>`**, after Stages 6–7 the pipeline runs **Stage 9**:
+
+1. **`precompute_tree_distances`**  
+   For each **observed** leaf **i**, BFS over the **current CLNJ tree** with **edge_weights** to fill an **n_obs × n_obs** cache of **patristic** distances between observed taxa. This is the metric geometry used for MDL on the **observed** set.
+
+2. **`mdl_cluster_tree(...)`**  
+   Recursively partitions the tree into **clusters** of observed taxa using **Minimum Description Length (MDL)**-style scores (`description_length`, parameter **`mj`** from **`--mdl-mj`**, merge control **`--mdl-merge-threshold`**). Each **`Cluster`** stores:
+   - **`observed_members`**, **`center_node`** (tree node acting as representative),
+   - **`parent_cluster_id` / `child_cluster_ids`** for a **hierarchy**,
+   - **`node_to_cluster`** maps each observed index → cluster id.
+
+3. **`TreeState` assembly** (`pipeline.cpp`)  
+   Copies **names**, **sequences**, **aln_len**, full **D**, **adjacency**, **edge_weights**, **hidden_info**, resolved **`DistModel`**, **gamma**, **base frequencies**, **`min_shared_sites`**, **`tree_algo`**, **`distance_method`**, k-mer metadata (for consistency), **`cluster_tree`**, and for alignment mode builds **`cached_nuc_idx`** / **`cached_valid`** (per-site A/C/G/T index + validity) so insertion avoids rebuilding full one-hot tensors.
+
+4. **`save_tree_state`** (`tree_state.cpp`)  
+   Writes a **versioned binary** (magic **`CLNJ`**, **`VERSION = 2`**) containing all of the above for **`load_tree_state`** on **`insert`**.
+
+**Stage 9 is the bridge** between “tree as a printed result” and **Phase 2**. Without **`--save-state`**, **Phase 2 cannot run** because there is no cluster hierarchy or serialized **D**/topology.
+
+---
+
+## Phase 2 — Dynamic (online) insertion
+
+**Files:** `online_insertion.{h,cpp}`, `distance.{h,cpp}`, `tree_state.{h,cpp}`, `pipeline.cpp` (`run_insertion_pipeline`).
+
+**Entry point:** `clnj_pipeline insert <state> <new.fasta> [-o updated.state]`
+
+### Purpose
+
+Add **one or many** new sequences (same **alignment length** **`aln_len`** as stored; typically **pre-aligned** to the same reference) into the **existing** tree while:
+
+- Preserving the **substitution model** and **gamma** used at build time.
+- **Extending** **D** only where needed (to cluster centers, cluster members, and between new taxa in the same cluster batch).
+- **Locally** re-optimizing topology with the **same** NJ/MFNJ/BioNJ **local** functions as CLNJ.
+
+### Algorithm (high level)
+
+Implemented in **`insert_batch`** (`online_insertion.cpp`):
+
+1. **Load state**  
+   **`load_tree_state`** → **`TreeState`** must contain a **non-empty** **`cluster_tree`**.
+
+2. **Encode new sequences**  
+   **`encode_sequence_flat`**: per-site **nucleotide index** (−1 if gap/ambiguous) and **valid** flag — same information as one-hot rows, compact.
+
+3. **Phase A — Distance to cluster centers**  
+   For each new sequence, compute distances to every **unique** **`center_node`** among clusters using either:
+   - **`compute_distance_to_subset_cached`** (if **`cached_nuc_idx`** present — **fast path**), or  
+   - **`compute_distance_to_subset`** after **`one_hot_encode`** of existing sequences (**cache miss**).
+
+4. **Hierarchical cluster assignment**  
+   **`find_cluster_hierarchical`**: walk the **cluster tree** from the root, comparing the new taxon’s distances to **child cluster centers** (with fallback leaf scan). Produces **`target_cluster_id`** per new taxon.
+
+5. **Remap hidden node ids**  
+   **`remap_hidden_nodes`**: shift hidden-node indices by **`batch_size`** so new observed ids **`old_n .. old_n+batch−1`** stay contiguous **0 .. new_n−1** for observed ordering conventions.
+
+6. **Extend **D****  
+   - Copy old **D** into **`new_D`** (top-left block).
+   - For each new taxon vs **old members** of its assigned cluster: pairwise model distances (cached or one-hot path).
+   - For **multiple** new taxa in the **same** cluster: fill **new–new** blocks using the same **JC69/K2P/TN93** formulas on **column-wise** counts (inline in `insert_batch`).
+
+7. **Augment graph**  
+   Append **isolated** observed nodes for each new taxon to **adjacency**; set **`n_observed = new_n`**; extend **cache** arrays if present.
+
+8. **Per-cluster local rebuild**  
+   For each cluster that received new taxa:
+   - **`old_members`** = previous **observed_members**; **`all_members`** = union with new ids.
+   - **`find_steiner_tree`**: prune the current tree to the minimal subtree spanning **old_members** (Steiner nodes may include **hidden** nodes).
+   - **`find_boundary_edges`**: edges from Steiner nodes to the **rest** of the tree (attachment points).
+   - **`remove_steiner_tree`**: cut that subgraph while keeping boundary metadata.
+   - Build **`DistanceOracle`** on **updated** **D** and working **adjacency** / **edge_weights**.
+   - **`local_fn`** (`nj_local` / `mfnj_local` / `bionj_local`) on **`member_list`** — same local reconstruction as CLNJ.
+   - **`install_nj_and_reconnect`** (or direct edge install for degenerate cases): splice local tree back and reconnect **boundary** edges.
+   - Update **`cluster.observed_members`** and **`node_to_cluster`** for new ids.
+
+9. **Results**  
+   Each taxon gets **`InsertionResult`**: **`new_obs_id`**, **`target_cluster_id`**, **`success`**, **`message`**.
+
+10. **Save**  
+    **`save_tree_state`** to **`--output-state`** or overwrite input path.
+
+### Invariants and assumptions
+
+- **Alignment length** of new sequences must match **`state.aln_len`** (padding/truncation behavior follows `encode_sequence_flat` and FASTA content).
+- **Cluster tree** must have been built from the **same** tree that produced **D** and **adjacency** (consistent **Stage 9**).
+- Insertion **does not** re-run Algorithm 2 / MLVMST globally; it is **local** to assigned clusters — appropriate for **incremental** updates when the MDL partition is meaningful.
+
+---
+
+## CLI: `build`, `insert`, and `dump`
+
+**File:** `main.cpp` (CLI11).
+
+| Command | Purpose |
+|---------|---------|
+| **`build`** | Full Stages 0–8; **Stage 9** if **`--save-state`** is set. |
+| **`insert`** | Phase 2: load state, insert FASTA records, save updated state. |
+| **`dump`** | Load state and print **summary stats** (validation / debugging). |
+
+**`build` positional arguments:**  
+`fasta` (required), `min_non_gap` (default 100), `subsample_n` (default 0), `tree_algo` (`nj` \| `mfnj` \| `bionj`, default `mfnj`).
+
+**Important flags for the full pipeline:**
+
+- **`--save-state <path>`** — required to enable **Phase 2** later.
+- **`--mdl-mj`**, **`--mdl-merge-threshold`** — tune **MDL** cluster tree (Stage 9).
+
+Run **`clnj_pipeline build --help`** and **`clnj_pipeline insert --help`** for the complete flag list.
+
+---
+
+## Persistent state: `TreeState` binary format
+
+**File:** `tree_state.cpp`.
+
+| Field | Meaning |
+|-------|---------|
+| Magic / **VERSION** | **`0x434C4E4A` ("CLNJ")**, version **2** — readers must match. |
+| **n_observed**, **next_hidden_id**, **aln_len** | Dimensions and hidden-id cursor. |
+| **model**, **gamma_alpha**, **gA..gT**, **min_shared_sites** | Distance model snapshot. |
+| **tree_algo**, **distance_method**, **kmer_size**, **sketch_size** | Reproducibility / consistency. |
+| **names**, **sequences** | Full alignment strings. |
+| **D** | Dense **n × n** `double` matrix (row-major Eigen storage). |
+| **adjacency**, **edge_weights**, **hidden_info** | CLNJ tree topology and branch lengths. |
+| **cluster_tree** | **MDL** hierarchy: clusters, members, centers, parent/child links, **node_to_cluster**. |
+| **cached_nuc_idx**, **cached_valid** | Flat **n × aln_len** arrays for fast insertion (alignment mode). |
+
+**Security / portability:** binary layout is **native-endian**; treat state files as **opaque** blobs produced and consumed only by this tool (or compatible versions).
+
+---
+
+## Module catalog (every source file)
+
+| Path | Responsibility |
+|------|----------------|
+| **`main.cpp`** | CLI11 app: subcommands **`build`**, **`insert`**, **`dump`**; parses **`PipelineArgs`** / **`InsertionArgs`**. |
+| **`pipeline.h`** | **`PipelineArgs`**, **`InsertionArgs`**, **`run_pipeline`**, **`run_insertion_pipeline`**, **`dump_state`**. |
+| **`pipeline.cpp`** | Orchestrates Stages **0–9**; builds **`TreeState`**; calls **`save_tree_state`**; **`run_insertion_pipeline`** wraps **`insert_batch`**. |
+| **`types.h`** | Global constants (**`MAX_DIST`**, **`MIN_BRANCH`**, **`EPS`**, …), Eigen aliases, **Adjacency** / **EdgeWeights**, result structs (**`ClnjResult`**, **`TreeStats`**, …), **`DistModel`**, **`TreeAlgo`**, **`Cluster`**, **`ClusterTree`**, **`TreeState`**, **`InsertionResult`**. |
+| **`fasta_parser.h` / `.cpp`** | **`parse_fasta`**, **`load_clean_fasta`** — I/O and filtering. |
+| **`alignment_utils.h` / `.cpp`** | **`is_aligned`**, **`align_with_mafft`**. |
+| **`one_hot.h` / `.cpp`** | **`OneHotData`**, **`one_hot_encode`** — (n,m,4) layout for batch distance + diagnostics. |
+| **`distance.h` / `.cpp`** | Pair statistics, **AUTO**, **`compute_distance_matrix`**, model corrections, **`compute_distance_to_subset`** / **`_cached`**, **`encode_sequence_flat`** for insertion. |
+| **`iqtree_interface.h` / `.cpp`** | External **IQ-TREE2** invocation and log parsing. |
+| **`kmer_distance.h` / `.cpp`** | **Experimental** MinHash / Mash-style distances (`kmer_distance_matrix`). |
+| **`algorithm2.h` / `.cpp`** | **`construct_FC_and_GU`**. |
+| **`mlvmst.h` / `.cpp`** | **`build_mlvmst`**. |
+| **`distance_oracle.h` / `.cpp`** | **`DistanceOracle`**, **`get_tree_distance`** — matrix vs tree-path queries for local NJ. |
+| **`nj.h` / `.cpp`** | Standard NJ (global driver + **local** neighborhood rebuild). |
+| **`mfnj.h` / `.cpp`** | MFNJ polytomy-aware local/global NJ. |
+| **`bionj.h` / `.cpp`** | BioNJ local/global. |
+| **`clnj.h` / `.cpp`** | **`clnj_clean`** — main CLNJ loop over MLVMST internal nodes. |
+| **`mdl_clustering.h` / `.cpp`** | **`precompute_tree_distances`**, **`mdl_cluster_tree`** — Stage 9. |
+| **`tree_state.h` / `.cpp`** | **`save_tree_state`**, **`load_tree_state`** — binary persistence. |
+| **`online_insertion.h` / `.cpp`** | **`insert_taxon`**, **`insert_batch`** — Phase 2. |
+| **`tree_analysis.h` / `.cpp`** | **`analyze_tree`** — Stage 7 reporting. |
+
+---
+
+## Implementation note: sequences, one-hot, and planned direct encoding
+
+| Layer | Today | Planned refactor (your direction) |
+|-------|-------|-----------------------------------|
+| **Biological input** | Aligned strings in **`CleanResult`** | Unchanged. |
+| **Stage 3 (batch)** | **`one_hot_encode` → `compute_distance_matrix`** | Same **formulas**, but iterate **columns** on **A/C/G/T** (+ masks) **without** allocating full **(n,m,4)** float tensor. |
+| **Stage 2 diagnostics** | **`compute_pair_counts(OneHotData)`** | Equivalent stats from **character** scans. |
+| **Insertion** | Already uses **`encode_sequence_flat`** + **`compute_distance_to_subset_cached`** | Aligns with “direct” per-site encoding; batch path may follow the same style. |
+
+Algorithm 2, MLVMST, CLNJ, MDL, and insertion **logic** depend on **D** and **tree topology**, not on the internal representation used to fill **D**.
+
+---
+
+## Experimental: alignment-free k-mer distance
+
+**Files:** `kmer_distance.{h,cpp}`, branches in **`pipeline.cpp`**.
+
+- **`--distance-method kmer`**: skips alignment Stage 0 shortcut, uses **`kmer_distance_matrix`** (canonical k-mers, MinHash, Mash distance).
+- Included for **experimentation** / comparison, **not** the primary methodology for the **alignment-based** LTGM + CLNJ story.
+- **Dynamic insertion** is designed around **alignment-based** **`TreeState`** (cached nuc indices, **`aln_len`**); k-mer **build** + **insert** combinations should be validated carefully before use in production.
+
+---
+
+## Distance models
+
+| Model | Description |
+|-------|-------------|
+| **JC69** | Jukes–Cantor |
+| **K2P** | Kimura 2-parameter (Ts vs Tv) |
+| **TN93** | Tamura–Nei + unequal base frequencies |
+| **LOGDET** | Log-determinant / paralinear |
+| **AUTO** | Heuristic from alignment diagnostics |
+| **IQTREE** | External IQ-TREE2 → mapped to JC69/K2P/TN93 + optional gamma |
+
+Gamma: **`--gamma-alpha`** applies the same transform as in the Python pipeline.
+
+---
+
+## Tree reconstruction algorithms
+
+| CLI | Algorithm |
+|-----|-----------|
+| **`nj`** | Neighbor-joining |
+| **`mfnj`** (default) | Multi-furcating NJ (tie-aware polytomies) |
+| **`bionj`** | BioNJ (variance-style weighting) |
+
+Used in **CLNJ** (Stage 6) and **Phase 2** local rebuilds (`state.tree_algo`).
+
+---
+
+## Key features
+
+- **Full lifecycle**: batch **D → Algorithm 2 → MLVMST → CLNJ** + **MDL cluster tree** + **serialized state** + **online insertion**.
+- **Multi-model** distances with **pairwise deletion** and **gamma** option.
+- **MAFFT** integration; **IQ-TREE2** optional model selection.
+- **Distance oracle** for consistent local distances with **hidden** nodes.
+- **MDL**-guided **cluster assignment** for scalable incremental updates.
+- **Deterministic subsampling** (seed 42).
+- **Eigen** + **CLI11** via CMake **FetchContent**.
+
+---
+
+## Requirements and building
+
+**Build:** C++17, CMake ≥ 3.14, first configure downloads **Eigen 3.4.0** and **CLI11 2.4.1**.
+
+**Runtime tools (optional):** **MAFFT** (auto-align), **IQ-TREE2** (`--model IQTREE`).
 
 ```bash
-# 1. Navigate to the project directory
 cd clnj_cpp
-
-# 2. Create and enter the build directory
 mkdir -p build && cd build
-
-# 3. Configure with CMake (downloads Eigen and CLI11 on first run)
 cmake ..
-
-# 4. Build (use all available cores)
-cmake --build . -j$(nproc)
+cmake --build . -j"$(nproc)"
 ```
 
-The executable `clnj_pipeline` will be created in the `build/` directory.
-
-To rebuild after code changes:
-
-```bash
-cd build && cmake --build . -j$(nproc)
-```
-
----
-
-## Usage
-
-### Basic Syntax
-
-```bash
-./clnj_pipeline <fasta_file> [min_non_gap] [subsample_n] [tree_algo] [options]
-```
-
-### Minimal Run
-
-```bash
-./clnj_pipeline /path/to/sequences.fasta
-```
-
-This uses all defaults: JC69 model, MFNJ algorithm, no subsampling, alignment-based distance.
-
-### Typical Run with Options
-
-```bash
-./clnj_pipeline /path/to/sequences.fasta 100 0 mfnj \
-    --model TN93 \
-    --gamma-alpha 0.5 \
-    --report-negatives \
-    --trace-zero-edges
-```
-
----
-
-## CLI Reference
-
-### Positional Arguments
-
-| Position | Name | Required | Default | Description |
-|---|---|---|---|---|
-| 1 | `fasta` | Yes | — | Path to FASTA file (aligned or unaligned) |
-| 2 | `min_non_gap` | No | 100 | Minimum valid (non-gap) nucleotides per sequence |
-| 3 | `subsample_n` | No | 0 | Subsample to N sequences; 0 = use all |
-| 4 | `tree_algo` | No | `mfnj` | Tree algorithm: `nj`, `mfnj`, or `bionj` |
-
-### Named Options
-
-| Flag | Short | Default | Description |
-|---|---|---|---|
-| `--model` | `-m` | `JC69` | Distance model: `JC69`, `K2P`, `TN93`, `LOGDET`, `AUTO`, `IQTREE` |
-| `--gamma-alpha` | `-g` | (none) | Gamma shape parameter for rate heterogeneity |
-| `--no-align` | | false | Skip MAFFT alignment even if input is unaligned |
-| `--rna-struct` | | false | Use MAFFT X-INS-i for RNA structure-aware alignment |
-| `--min-shared-sites` | | 100 | Minimum shared valid sites for a valid pairwise distance |
-| `--max-ambiguity` | | 0.5 | Maximum fraction of ambiguity codes per sequence |
-| `--length-percentile-cutoff` | | 5.0 | Remove sequences below this percentile of valid-site count |
-| `--distance-method` | | `alignment` | Distance method: `alignment` or `kmer` |
-| `--kmer-size` | | 16 | K-mer size for alignment-free distance |
-| `--sketch-size` | | 1000 | MinHash sketch size for k-mer distance |
-| `--report-negatives` | | false | Track and report negative-value diagnostic counters |
-| `--trace-zero-edges` | | false | Track and report zero-length edges during CLNJ |
+Executable: **`clnj_pipeline`**.
 
 ---
 
 ## Examples
 
-### 1. Basic run with default settings (JC69 + MFNJ)
+**1. Full pipeline: build with state, then insert**
 
 ```bash
-./clnj_pipeline data/carnivora_cytb_aligned.fasta
+./clnj_pipeline build data/aligned.fasta 100 0 mfnj \
+  --model TN93 \
+  --save-state project.state \
+  --mdl-mj 7.0 \
+  --mdl-merge-threshold 100
+
+./clnj_pipeline insert project.state new_taxa.fasta -o project_updated.state
+# Further waves:
+./clnj_pipeline insert project_updated.state more_taxa.fasta -o project_v3.state
 ```
 
-### 2. Using K2P model with BioNJ
+**2. Batch-only tree (no insertion / no Stage 9)**
 
 ```bash
-./clnj_pipeline data/sequences.fasta 100 0 bionj --model K2P
+./clnj_pipeline build data/aligned.fasta --model AUTO
 ```
 
-### 3. AUTO model selection with gamma correction
+**3. Inspect a state file**
 
 ```bash
-./clnj_pipeline data/sequences.fasta 100 0 mfnj --model AUTO --gamma-alpha 0.5
-```
-
-### 4. IQ-TREE model selection (requires iqtree2 on PATH)
-
-```bash
-./clnj_pipeline data/sequences.fasta 100 0 mfnj --model IQTREE
-```
-
-### 5. Alignment-free k-mer distance
-
-```bash
-./clnj_pipeline data/unaligned_sequences.fasta 50 0 mfnj \
-    --distance-method kmer --kmer-size 16 --sketch-size 1000
-```
-
-### 6. Subsampling to 50 sequences with diagnostics
-
-```bash
-./clnj_pipeline data/large_dataset.fasta 100 50 mfnj \
-    --model TN93 --report-negatives --trace-zero-edges
-```
-
-### 7. Unaligned input with automatic MAFFT alignment
-
-```bash
-./clnj_pipeline data/unaligned.fasta 100 0 mfnj --model JC69
-```
-
-### 8. RNA sequences with structure-aware alignment
-
-```bash
-./clnj_pipeline data/16s_rRNA.fasta 100 0 mfnj --rna-struct --model AUTO
+./clnj_pipeline dump project.state
 ```
 
 ---
 
 ## Diagnostics
 
-Two optional diagnostic modes provide detailed insight into the numerical behavior of the tree reconstruction:
-
-### Negative-Value Counters (`--report-negatives`)
-
-Tracks how many times raw distance or branch-length values fall below -1e-12 during local NJ reconstruction. This is normal for non-additive distance matrices but useful for assessing data quality.
-
-**Tracked categories:**
-
-| Category | Algorithm | Meaning |
-|---|---|---|
-| `initial_pair` | All | Oracle distance for a 2-node neighborhood was negative |
-| `oracle_dist` | All | Pairwise oracle distance in local D matrix was negative |
-| `delta_i` | NJ, BioNJ | Raw branch length delta_i was negative before redistribution |
-| `delta_j` | NJ, BioNJ | Raw branch length delta_j was negative before redistribution |
-| `NJ_update_d_uk` | NJ | Distance update for new hidden node produced negative value |
-| `BioNJ_update_d_uk` | BioNJ | Weighted distance update produced negative value |
-| `final_edge` | All | Final edge between last 2 active nodes was negative |
-| `mfnj_branch` | MFNJ | Branch length in MFNJ group (with complement) was negative |
-| `mfnj_branch_final` | MFNJ | Branch length in final MFNJ group (no complement) was negative |
-| `mfnj_update_d_uk` | MFNJ | Distance update for new MFNJ hidden node was negative |
-
-### Zero-Edge Log (`--trace-zero-edges`)
-
-Records every edge created with weight < 1e-9, providing a detailed log of near-zero branch lengths.
-
-**Case types:**
-
-| Case | Meaning |
-|---|---|
-| `initial_pair` | A 2-node neighborhood had near-zero oracle distance |
-| `create_hidden` | A delta_i or delta_j was near-zero after redistribution (NJ/BioNJ) |
-| `final_edge` | The final edge between the last 2 active nodes was near-zero |
-| `final_star` | A branch in the 3-node star topology was near-zero (MFNJ) |
-| `mfnj_polytomy` | A branch in an MFNJ polytomy group was near-zero |
-
-Each entry records: the edge endpoints (a, b), the weight (w), raw values before clamping, the reason string, and the full node list of the local neighborhood.
+- **`--report-negatives`**: aggregate negative intermediate values during local NJ (non-additive **D**).
+- **`--trace-zero-edges`**: log near-zero edges during CLNJ (`initial_pair`, `mfnj_polytomy`, …).
 
 ---
 
-## Pipeline Constants
+## Pipeline constants
 
-All numerical constants match the Python implementation exactly:
-
-| Constant | Value | Purpose |
-|---|---|---|
-| `MAX_DIST` | 10.0 | Maximum allowed pairwise distance (saturation cap) |
-| `MIN_BRANCH` | 1e-6 | Minimum branch length floor (default for floored run) |
-| `EPS` | 1e-12 | Floating-point comparison tolerance |
-| `TIE_TOL` | 1e-9 | Q-matrix tie tolerance for MFNJ |
-| `SEED` | 42 | Random seed for reproducible subsampling |
-| `LOG_FLOOR` | 1e-300 | Floor to prevent log(0) in distance corrections |
-| `FREQ_FLOOR` | 1e-10 | Floor for base frequency estimates |
+| Symbol | Value | Role |
+|--------|-------|------|
+| `MAX_DIST` | 10.0 | Distance saturation cap |
+| `MIN_BRANCH` | 1e-6 | Default branch floor |
+| `EPS` | 1e-12 | Floating-point tolerance |
+| `TIE_TOL` | 1e-9 | MFNJ tie tolerance |
+| `SEED` | 42 | Subsampling RNG |
+| `LOG_FLOOR` | 1e-300 | Numerical floor in logs |
+| `FREQ_FLOOR` | 1e-10 | Base frequency floor |
 
 ---
 
-## GitHub repository (`MSTree_Phylogeny`)
+## GitHub (`MSTree_Phylogeny`)
 
-This project is intended to live at **`https://github.com/Jatin07gupta/MSTree_Phylogeny`**.
+**URL:** https://github.com/Jatin07gupta/MSTree_Phylogeny
 
-### Why the repo might be missing on GitHub
-
-Git stores **two different things**:
-
-1. **Your computer** — a full copy of files + history (this is what `git commit` updates).
-2. **GitHub** — a **separate** website copy that only updates when **`git push`** succeeds.
-
-If you never see the project on GitHub, it is usually because:
-
-- **`git push` never completed** — GitHub asks for a **username + password/token**. There is no password login anymore; you must use a [**Personal Access Token (PAT)**](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) or **SSH keys**. Without that, the push stops and **nothing is uploaded**.
-- **The empty repository was never created** — The first push to a URL that does not exist yet will fail. Create the repo on GitHub first (empty, no README), **or** use the script below which creates it via the API.
-
-So: **clear in draw.io ≠ on GitHub** until a successful push. This is normal Git behavior, not a bug in your project.
-
-### Automated create + push (recommended if you have a token)
-
-From the **`clnj_cpp`** root’s parent context, after [creating a classic PAT](https://github.com/settings/tokens) with the **`repo`** scope:
+**Push reminder:** commits are local until **`git push`** succeeds (PAT or SSH). To create the remote repo and push in one step (with a classic PAT):
 
 ```bash
-export GITHUB_TOKEN=ghp_your_token_here   # do not share or commit this
+export GITHUB_TOKEN=ghp_your_token_here
 ./scripts/create_github_repo_and_push.sh
 ```
 
-The script creates **`MSTree_Phylogeny`** under **Jatin07gupta** if it does not exist, then pushes **`main`**. Revoke or delete the token when you no longer need it.
-
-### Manual first-time publish
-
-1. On GitHub: **New repository** → name **`MSTree_Phylogeny`** → leave it **empty** (no README/license).
-2. From this directory:
-
-   ```bash
-   git init
-   git add .
-   git status   # confirm build/ is not listed
-   git commit -m "Initial commit: MSTree phylogeny C++ pipeline"
-   git branch -M main
-   git remote add origin https://github.com/Jatin07gupta/MSTree_Phylogeny.git
-   git push -u origin main
-   ```
-
-When prompted for a password on HTTPS, paste your **PAT** (not your GitHub account password).
-
-Use SSH instead of HTTPS if you prefer: `git@github.com:Jatin07gupta/MSTree_Phylogeny.git`.
+See script comments in **`scripts/create_github_repo_and_push.sh`** for security notes.
 
 ---
 
 ## References
 
-- Saitou, N., & Nei, M. (1987). The neighbor-joining method: a new method for reconstructing phylogenetic trees. *Molecular Biology and Evolution*, 4(4), 406-425.
-- Fernandez, M., Segura-Alabart, N., & Serratosa, F. (2023). The MultiFurcating Neighbor-Joining Algorithm for Reconstructing Polytomic Phylogenetic Trees. *Journal of Molecular Evolution*.
-- Gascuel, O. (1997). BIONJ: an improved version of the NJ algorithm based on a simple model of sequence data. *Molecular Biology and Evolution*, 14(7), 685-695.
-- Jukes, T. H., & Cantor, C. R. (1969). Evolution of Protein Molecules. *Mammalian Protein Metabolism*, 3, 21-132.
-- Kimura, M. (1980). A simple method for estimating evolutionary rates of base substitutions. *Journal of Molecular Evolution*, 16(2), 111-120.
-- Tamura, K., & Nei, M. (1993). Estimation of the number of nucleotide substitutions in the control region of mitochondrial DNA. *Molecular Biology and Evolution*, 10(3), 512-526.
-- Katoh, K., & Standley, D. M. (2013). MAFFT multiple sequence alignment software version 7. *Molecular Biology and Evolution*, 30(4), 772-780.
-- Nguyen, L. T., et al. (2015). IQ-TREE: A fast and effective stochastic algorithm for estimating maximum-likelihood phylogenies. *Molecular Biology and Evolution*, 32(1), 268-274.
+- Saitou & Nei (1987) — Neighbor-joining. *MBE*.
+- Fernandez et al. (2023) — Multi-furcating NJ. *J Mol Evol*.
+- Gascuel (1997) — BioNJ. *MBE*.
+- Jukes & Cantor (1969); Kimura (1980); Tamura & Nei (1993) — Substitution models.
+- Katoh & Standley (2013) — MAFFT. *MBE*.
+- Nguyen et al. (2015) — IQ-TREE. *MBE*.
