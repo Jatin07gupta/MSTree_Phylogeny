@@ -488,7 +488,32 @@ All numerical constants match the Python implementation exactly:
 
 This project is intended to live at **`https://github.com/Jatin07gupta/MSTree_Phylogeny`**.
 
-**First-time publish**
+### Why the repo might be missing on GitHub
+
+Git stores **two different things**:
+
+1. **Your computer** — a full copy of files + history (this is what `git commit` updates).
+2. **GitHub** — a **separate** website copy that only updates when **`git push`** succeeds.
+
+If you never see the project on GitHub, it is usually because:
+
+- **`git push` never completed** — GitHub asks for a **username + password/token**. There is no password login anymore; you must use a [**Personal Access Token (PAT)**](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) or **SSH keys**. Without that, the push stops and **nothing is uploaded**.
+- **The empty repository was never created** — The first push to a URL that does not exist yet will fail. Create the repo on GitHub first (empty, no README), **or** use the script below which creates it via the API.
+
+So: **clear in draw.io ≠ on GitHub** until a successful push. This is normal Git behavior, not a bug in your project.
+
+### Automated create + push (recommended if you have a token)
+
+From the **`clnj_cpp`** root’s parent context, after [creating a classic PAT](https://github.com/settings/tokens) with the **`repo`** scope:
+
+```bash
+export GITHUB_TOKEN=ghp_your_token_here   # do not share or commit this
+./scripts/create_github_repo_and_push.sh
+```
+
+The script creates **`MSTree_Phylogeny`** under **Jatin07gupta** if it does not exist, then pushes **`main`**. Revoke or delete the token when you no longer need it.
+
+### Manual first-time publish
 
 1. On GitHub: **New repository** → name **`MSTree_Phylogeny`** → leave it **empty** (no README/license).
 2. From this directory:
@@ -502,6 +527,8 @@ This project is intended to live at **`https://github.com/Jatin07gupta/MSTree_Ph
    git remote add origin https://github.com/Jatin07gupta/MSTree_Phylogeny.git
    git push -u origin main
    ```
+
+When prompted for a password on HTTPS, paste your **PAT** (not your GitHub account password).
 
 Use SSH instead of HTTPS if you prefer: `git@github.com:Jatin07gupta/MSTree_Phylogeny.git`.
 
